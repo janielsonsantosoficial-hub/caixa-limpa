@@ -1,112 +1,114 @@
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from cryptography.fernet import Fernet
+from datetime import datetime, timezone
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
+import psycopg
+from psycopg.rows import dict_row
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL não definido")
-if not TOKEN_ENCRYPTION_KEY:
-    raise RuntimeError("TOKEN_ENCRYPTION_KEY não definido")
 
-fernet = Fernet(TOKEN_ENCRYPTION_KEY.encode("utf-8"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def _conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada no ambiente do Render.")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
 
 def init_db():
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS gmail_tokens (
-            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-            token_enc BYTEA NOT NULL,
-            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS cleanup_runs (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            moved_count INTEGER NOT NULL DEFAULT 0,
-            ran_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-        """)
-        c.commit()
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    email TEXT PRIMARY KEY,
+                    label_quarantine TEXT,
+                    label_importantes TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tokens (
+                    email TEXT PRIMARY KEY,
+                    token_encrypted TEXT NOT NULL,
+                    has_refresh_token BOOLEAN DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cleanup_runs (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    moved_count INT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+        conn.commit()
 
-def upsert_user(email: str) -> int:
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""
-            INSERT INTO users (email) VALUES (%s)
-            ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-            RETURNING id;
-        """, (email,))
-        user_id = cur.fetchone()[0]
-        c.commit()
-        return user_id
 
-def set_user_active(email: str, active: bool):
-    with conn() as c, c.cursor() as cur:
-        cur.execute("UPDATE users SET is_active=%s WHERE email=%s", (active, email))
-        c.commit()
+def upsert_user(email: str, label_quarantine: str, label_importantes: str):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (email, label_quarantine, label_importantes)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (email) DO UPDATE SET
+                    label_quarantine = EXCLUDED.label_quarantine,
+                    label_importantes = EXCLUDED.label_importantes;
+            """, (email, label_quarantine, label_importantes))
+        conn.commit()
 
-def get_user(email: str):
-    with conn() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM users WHERE email=%s", (email,))
-        return cur.fetchone()
 
-def save_token(user_id: int, token_json: str):
-    token_enc = fernet.encrypt(token_json.encode("utf-8"))
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""
-            INSERT INTO gmail_tokens (user_id, token_enc)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id)
-            DO UPDATE SET token_enc = EXCLUDED.token_enc, updated_at = NOW();
-        """, (user_id, token_enc))
-        c.commit()
+def save_token(email: str, token_encrypted: str, has_refresh_token: bool):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tokens (email, token_encrypted, has_refresh_token, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (email) DO UPDATE SET
+                    token_encrypted = EXCLUDED.token_encrypted,
+                    has_refresh_token = EXCLUDED.has_refresh_token,
+                    updated_at = NOW();
+            """, (email, token_encrypted, has_refresh_token))
+        conn.commit()
 
-def load_token(user_id: int) -> str | None:
-    with conn() as c, c.cursor() as cur:
-        cur.execute("SELECT token_enc FROM gmail_tokens WHERE user_id=%s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        token_enc = row[0]
-        token_json = fernet.decrypt(token_enc).decode("utf-8")
-        return token_json
 
-def log_cleanup_run(user_id: int, moved: int):
-    with conn() as c, c.cursor() as cur:
-        cur.execute(
-            "INSERT INTO cleanup_runs (user_id, moved_count) VALUES (%s, %s)",
-            (user_id, moved),
-        )
-        c.commit()
+def load_token(email: str):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT token_encrypted, has_refresh_token FROM tokens WHERE email=%s;", (email,))
+            row = cur.fetchone()
+            return row if row else None
 
-def list_active_users():
-    with conn() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT id, email FROM users WHERE is_active=true")
-        return cur.fetchall()
 
-def last_runs(email: str, limit: int = 10):
-    with conn() as c, c.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-        SELECT cr.moved_count, cr.ran_at
-        FROM cleanup_runs cr
-        JOIN users u ON u.id = cr.user_id
-        WHERE u.email=%s
-        ORDER BY cr.ran_at DESC
-        LIMIT %s
-        """, (email, limit))
-        return cur.fetchall()
+def list_active_users(limit: int = 200):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.email, u.label_quarantine, u.label_importantes
+                FROM users u
+                ORDER BY u.created_at DESC
+                LIMIT %s;
+            """, (limit,))
+            return cur.fetchall()
+
+
+def log_cleanup_run(email: str, moved_count: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cleanup_runs (email, moved_count)
+                VALUES (%s, %s);
+            """, (email, moved_count))
+        conn.commit()
+
+
+def last_runs(limit: int = 50):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT email, moved_count, created_at
+                FROM cleanup_runs
+                ORDER BY created_at DESC
+                LIMIT %s;
+            """, (limit,))
+            return cur.fetchall()
