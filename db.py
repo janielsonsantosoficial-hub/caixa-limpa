@@ -2,7 +2,7 @@ import os
 import json
 from datetime import datetime, timezone
 
-import psycopg
+import psycopg2
 from psycopg.rows import dict_row
 
 
@@ -112,3 +112,4 @@ def last_runs(limit: int = 50):
                 LIMIT %s;
             """, (limit,))
             return cur.fetchall()
+
