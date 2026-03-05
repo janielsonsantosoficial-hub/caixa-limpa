@@ -1,249 +1,131 @@
-import base64
-import os
-import re
-from typing import Dict, List, Tuple
-
-from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 
-# =========================
-# CONFIG (pode ajustar)
-# =========================
+USER_ID = "me"
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-
-# Regras de “idade”
-PROMO_OLDER_THAN = os.getenv("PROMO_OLDER_THAN", "2d")         # promoções após 2 dias
-NOTIF_OLDER_THAN = os.getenv("NOTIF_OLDER_THAN", "1d")         # notificações após 1 dia
-UPDATES_OLDER_THAN = os.getenv("UPDATES_OLDER_THAN", "5d")     # atualizações após 5 dias
-
-# Lixo/Spam
-DELETE_SPAM_DIRECT = os.getenv("DELETE_SPAM_DIRECT", "true").lower() == "true"
-LIXO_PROMO_OLDER_THAN = os.getenv("LIXO_PROMO_OLDER_THAN", "30d")  # promoções muito antigas -> lixo (opcional)
-
-# “IMPORTANTES”: lista de termos/domínios para NÃO mexer (allowlist).
-# Tudo que bater aqui será excluído das movimentações.
-# Separe por vírgula
-IMPORTANT_ALLOWLIST = [
-    x.strip().lower()
-    for x in os.getenv(
-        "IMPORTANT_ALLOWLIST",
-        "banco,bradesco,itau,santander,nubank,inter,caixa,bb,work,trabalho,cliente,clientes,familia,família,comprovante,nota fiscal,nf,recibo,pagamento,fatura,contrato"
-    ).split(",")
-    if x.strip()
-]
-
-# Labels
-LABEL_ROOT = "CAIXA_LIMPA"
-LABEL_IMPORTANTES = f"{LABEL_ROOT}/IMPORTANTES"
-LABEL_PROMOCOES = f"{LABEL_ROOT}/PROMOCOES"
-LABEL_NOTIFICACOES = f"{LABEL_ROOT}/NOTIFICACOES"
-LABEL_QUARENTENA = f"{LABEL_ROOT}/QUARENTENA"   # vamos usar para UPDATES (ex: atualizações)
-LABEL_LIXO = f"{LABEL_ROOT}/LIXO"
-
-
-# =========================
-# Helpers
-# =========================
+LABELS = {
+    "PROMOCOES": "CAIXA_LIMPA/PROMOCOES",
+    "NOTIFICACOES": "CAIXA_LIMPA/NOTIFICACOES",
+    "QUARENTENA": "CAIXA_LIMPA/QUARENTENA",
+    "LIXO": "CAIXA_LIMPA/LIXO",
+}
 
 def get_gmail_service(creds: Credentials):
     return build("gmail", "v1", credentials=creds)
 
+def _list_labels(service):
+    resp = service.users().labels().list(userId=USER_ID).execute()
+    return resp.get("labels", [])
 
-def _normalize(s: str) -> str:
-    s = s.lower().strip()
-    # remove acentos simples (opcional). Mantive simples para não depender de lib externa.
-    s = s.replace("á", "a").replace("à", "a").replace("ã", "a").replace("â", "a")
-    s = s.replace("é", "e").replace("ê", "e")
-    s = s.replace("í", "i")
-    s = s.replace("ó", "o").replace("ô", "o").replace("õ", "o")
-    s = s.replace("ú", "u")
-    s = s.replace("ç", "c")
-    return s
-
-
-def _needs_skip_by_allowlist(query: str) -> str:
-    """
-    Constrói um trecho de query do Gmail para excluir termos importantes.
-    Ex: -("banco" OR "cliente" OR "fatura")
-    """
-    if not IMPORTANT_ALLOWLIST:
-        return query
-
-    terms = []
-    for t in IMPORTANT_ALLOWLIST:
-        t2 = t.replace('"', "")
-        if not t2:
-            continue
-        # coloca como frase
-        terms.append(f'"{t2}"')
-
-    if not terms:
-        return query
-
-    block = " OR ".join(terms)
-    return f'{query} -({block})'
-
-
-def _get_label_map(service) -> Dict[str, str]:
-    res = service.users().labels().list(userId="me").execute()
-    labels = res.get("labels", [])
-    return {l["name"]: l["id"] for l in labels}
-
+def _get_label_id_by_name(service, name: str) -> str | None:
+    for lb in _list_labels(service):
+        if lb.get("name") == name:
+            return lb.get("id")
+    return None
 
 def _create_label(service, name: str) -> str:
     body = {
         "name": name,
         "labelListVisibility": "labelShow",
         "messageListVisibility": "show",
+        "type": "user",
     }
-    created = service.users().labels().create(userId="me", body=body).execute()
-    return created["id"]
+    resp = service.users().labels().create(userId=USER_ID, body=body).execute()
+    return resp["id"]
 
-
-def ensure_caixa_limpa_labels(service) -> Dict[str, str]:
-    """
-    Garante a criação de:
-      CAIXA_LIMPA/IMPORTANTES
-      CAIXA_LIMPA/PROMOCOES
-      CAIXA_LIMPA/NOTIFICACOES
-      CAIXA_LIMPA/QUARENTENA
-      CAIXA_LIMPA/LIXO
-
-    Retorna dict: {nome_label: id_label}
-    """
-    label_map = _get_label_map(service)
-    needed = [LABEL_IMPORTANTES, LABEL_PROMOCOES, LABEL_NOTIFICACOES, LABEL_QUARENTENA, LABEL_LIXO]
-
-    for name in needed:
-        if name not in label_map:
+def ensure_caixa_limpa_labels(service):
+    ids = {}
+    for key, name in LABELS.items():
+        label_id = _get_label_id_by_name(service, name)
+        if not label_id:
             label_id = _create_label(service, name)
-            label_map[name] = label_id
-
-    return label_map
-
-
-def _list_message_ids(service, q: str, max_results: int) -> List[str]:
-    ids: List[str] = []
-    page_token = None
-
-    while len(ids) < max_results:
-        resp = service.users().messages().list(
-            userId="me",
-            q=q,
-            maxResults=min(500, max_results - len(ids)),
-            pageToken=page_token,
-        ).execute()
-
-        msgs = resp.get("messages", [])
-        ids.extend([m["id"] for m in msgs])
-
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
+        ids[key] = label_id
     return ids
 
+def _search_message_ids(service, query: str, max_results: int):
+    ids = []
+    page_token = None
+    while len(ids) < max_results:
+        resp = service.users().messages().list(
+            userId=USER_ID,
+            q=query,
+            maxResults=min(500, max_results - len(ids)),
+            pageToken=page_token
+        ).execute()
+        msgs = resp.get("messages", [])
+        ids.extend([m["id"] for m in msgs])
+        page_token = resp.get("nextPageToken")
+        if not page_token or not msgs:
+            break
+    return ids
 
-def _batch_move_to_label(service, message_ids: List[str], add_label_id: str, remove_inbox: bool = True) -> int:
+def _batch_modify_move(service, message_ids, add_label_id: str | None, remove_inbox: bool = True):
     if not message_ids:
         return 0
-
     body = {
         "ids": message_ids,
-        "addLabelIds": [add_label_id],
+        "addLabelIds": [add_label_id] if add_label_id else [],
         "removeLabelIds": ["INBOX"] if remove_inbox else [],
     }
-    service.users().messages().batchModify(userId="me", body=body).execute()
+    service.users().messages().batchModify(userId=USER_ID, body=body).execute()
     return len(message_ids)
 
-
-def _trash_messages(service, message_ids: List[str]) -> int:
-    """
-    Gmail API não tem batchTrash.
-    Então fazemos em loop (seguro e simples).
-    """
+def _trash_messages(service, message_ids):
+    # Trash é 1 por 1 (não tem batchTrash oficial)
     count = 0
     for mid in message_ids:
-        service.users().messages().trash(userId="me", id=mid).execute()
+        service.users().messages().trash(userId=USER_ID, id=mid).execute()
         count += 1
     return count
 
-
-# =========================
-# Regras (4 grupos)
-# =========================
-
-def mover_promocoes(service, label_id_promocoes: str, max_results: int = 200) -> int:
-    q = f"category:promotions older_than:{PROMO_OLDER_THAN} in:inbox"
-    q = _needs_skip_by_allowlist(q)
-    ids = _list_message_ids(service, q, max_results)
-    return _batch_move_to_label(service, ids, label_id_promocoes, remove_inbox=True)
-
-
-def mover_notificacoes(service, label_id_notificacoes: str, max_results: int = 200) -> int:
-    # Social + Updates leves geralmente são “notificações”
-    # Aqui usamos category:social como NOTIFICACOES
-    q = f"category:social older_than:{NOTIF_OLDER_THAN} in:inbox"
-    q = _needs_skip_by_allowlist(q)
-    ids = _list_message_ids(service, q, max_results)
-    return _batch_move_to_label(service, ids, label_id_notificacoes, remove_inbox=True)
-
-
-def mover_atualizacoes_para_quarentena(service, label_id_quarentena: str, max_results: int = 200) -> int:
-    # Updates = recibos automáticos, sistemas, etc (depois de 5 dias vai para QUARENTENA)
-    q = f"category:updates older_than:{UPDATES_OLDER_THAN} in:inbox"
-    q = _needs_skip_by_allowlist(q)
-    ids = _list_message_ids(service, q, max_results)
-    return _batch_move_to_label(service, ids, label_id_quarentena, remove_inbox=True)
-
-
-def lixo_promocoes_muito_antigas(service, label_id_lixo: str, max_results: int = 200) -> int:
+def executar_limpeza_completa(service, max_results_por_grupo: int = 200):
     """
-    Opcional: promoções muito antigas podem virar LIXO.
+    Regra:
+    - Importantes: não toca (fica na INBOX)
+    - Promoções: category:promotions older_than:2d -> PROMOCOES (remove INBOX)
+    - Notificações: category:social OR category:updates older_than:1d -> NOTIFICACOES (remove INBOX)
+    - Lixo/Spam: in:spam OR (category:promotions older_than:15d) -> LIXO (remove INBOX) e opcional trash
+    - Quarentena: “resto” opcional (aqui vamos usar updates older_than:5d que não caiu em notificações)
     """
-    if not LIXO_PROMO_OLDER_THAN:
-        return 0
-    q = f"category:promotions older_than:{LIXO_PROMO_OLDER_THAN} in:anywhere"
-    q = _needs_skip_by_allowlist(q)
-    ids = _list_message_ids(service, q, max_results)
-    # Aqui eu não removo INBOX porque elas já não deveriam estar no inbox; só etiqueta e organiza.
-    return _batch_move_to_label(service, ids, label_id_lixo, remove_inbox=False)
+    ids = ensure_caixa_limpa_labels(service)
 
-
-def limpar_spam(service, max_results: int = 200) -> int:
-    """
-    Spam = pode mandar para lixeira direto.
-    """
-    if not DELETE_SPAM_DIRECT:
-        return 0
-    q = "is:spam"
-    ids = _list_message_ids(service, q, max_results)
-    return _trash_messages(service, ids)
-
-
-def executar_limpeza_completa(service, max_results_por_grupo: int = 200) -> Dict[str, int]:
-    """
-    Roda todas as regras:
-    1) Promoções -> PROMOCOES (2d)
-    2) Notificações -> NOTIFICACOES (1d)
-    3) Atualizações -> QUARENTENA (5d)
-    4) Spam -> lixeira
-    + opcional: promoções muito antigas -> LIXO
-    """
-    label_map = ensure_caixa_limpa_labels(service)
-
-    moved_promos = mover_promocoes(service, label_map[LABEL_PROMOCOES], max_results=max_results_por_grupo)
-    moved_notifs = mover_notificacoes(service, label_map[LABEL_NOTIFICACOES], max_results=max_results_por_grupo)
-    moved_updates = mover_atualizacoes_para_quarentena(service, label_map[LABEL_QUARENTENA], max_results=max_results_por_grupo)
-    spam_trashed = limpar_spam(service, max_results=max_results_por_grupo)
-    moved_lixo = lixo_promocoes_muito_antigas(service, label_map[LABEL_LIXO], max_results=max_results_por_grupo)
-
-    return {
-        "promocoes_movidas": moved_promos,
-        "notificacoes_movidas": moved_notifs,
-        "atualizacoes_para_quarentena": moved_updates,
-        "spam_enviado_lixeira": spam_trashed,
-        "promocoes_muito_antigas_para_lixo": moved_lixo,
+    resultado = {
+        "promocoes": {"query": "", "moved": 0},
+        "notificacoes": {"query": "", "moved": 0},
+        "quarentena": {"query": "", "moved": 0},
+        "lixo": {"query": "", "moved": 0, "trashed": 0},
     }
+
+    # 1) Promoções (2 dias)
+    q_promocoes = "in:inbox category:promotions older_than:2d"
+    prom_ids = _search_message_ids(service, q_promocoes, max_results_por_grupo)
+    moved = _batch_modify_move(service, prom_ids, ids["PROMOCOES"], remove_inbox=True)
+    resultado["promocoes"] = {"query": q_promocoes, "moved": moved}
+
+    # 2) Notificações (1 dia) - social + updates
+    q_notif = "(in:inbox category:social older_than:1d) OR (in:inbox category:updates older_than:1d)"
+    notif_ids = _search_message_ids(service, q_notif, max_results_por_grupo)
+    moved = _batch_modify_move(service, notif_ids, ids["NOTIFICACOES"], remove_inbox=True)
+    resultado["notificacoes"] = {"query": q_notif, "moved": moved}
+
+    # 3) Quarentena (5 dias) - updates mais antigos (o que sobrou)
+    q_quar = "in:inbox category:updates older_than:5d"
+    quar_ids = _search_message_ids(service, q_quar, max_results_por_grupo)
+    moved = _batch_modify_move(service, quar_ids, ids["QUARENTENA"], remove_inbox=True)
+    resultado["quarentena"] = {"query": q_quar, "moved": moved}
+
+    # 4) Lixo/Spam
+    # - Spam: joga no lixo direto
+    q_spam = "in:spam"
+    spam_ids = _search_message_ids(service, q_spam, max_results_por_grupo)
+    trashed = _trash_messages(service, spam_ids)
+
+    # - Promoções muito antigas (15 dias) vira lixo
+    q_lixo = "in:inbox category:promotions older_than:15d"
+    lixo_ids = _search_message_ids(service, q_lixo, max_results_por_grupo)
+    moved = _batch_modify_move(service, lixo_ids, ids["LIXO"], remove_inbox=True)
+
+    resultado["lixo"] = {"query": f"{q_spam} + {q_lixo}", "moved": moved, "trashed": trashed}
+
+    return resultado
