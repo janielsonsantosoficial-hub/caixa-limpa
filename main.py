@@ -5,22 +5,20 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
-from googleapiclient.discovery import build
 
-from db import init_db, upsert_user, save_token, load_token, list_active_users, log_cleanup_run, last_runs
+from db import (
+    init_db, upsert_user, save_token, load_token,
+    list_active_users, log_cleanup_run, last_runs
+)
 from gmail_service import get_gmail_service, ensure_caixa_limpa_labels, mover_para_quarentena
 
 app = FastAPI()
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-# Em produção no Render você vai usar:
-# BASE_URL = "https://SEU-BACKEND.onrender.com"
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 REDIRECT_URI = f"{BASE_URL}/auth/callback"
 
-# Arquivo JSON do client do Google via ENV (mais fácil no Render)
-# Conteúdo inteiro do client_secret.json vai nessa variável
 GOOGLE_CLIENT_SECRET_JSON = os.getenv("GOOGLE_CLIENT_SECRET_JSON", "")
 
 FLOW_STORE: dict[str, Flow] = {}
@@ -39,8 +37,10 @@ def creds_from_db(user_id: int) -> Credentials | None:
     token_json = load_token(user_id)
     if not token_json:
         return None
+
     data = json.loads(token_json)
     creds = Credentials.from_authorized_user_info(data, scopes=SCOPES)
+
     if not creds.valid:
         if creds.expired and creds.refresh_token:
             creds.refresh(GoogleRequest())
@@ -64,18 +64,16 @@ def home():
 
 @app.get("/auth/login")
 def auth_login(email: str):
-    # no MVP: o "email" vem na query (no front isso será automático)
     flow = build_flow()
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
-    # guardamos também qual email está logando
+
     FLOW_STORE[state] = flow
-    # passamos email junto no state "paralelo" via memória
-    # (em produção: sessão/redis)
     flow._caixa_email = email  # type: ignore[attr-defined]
+
     return RedirectResponse(auth_url)
 
 @app.get("/auth/callback")
@@ -95,7 +93,6 @@ def auth_callback(request: Request):
     user_id = upsert_user(email)
     save_token(user_id, creds.to_json())
 
-    # cria labels e faz limpeza inicial
     service = get_gmail_service(creds)
     _, quar_id, _ = ensure_caixa_limpa_labels(service)
     moved = mover_para_quarentena(service, quar_id, max_results=50)
@@ -111,15 +108,15 @@ def auth_callback(request: Request):
 
 @app.get("/limpar-agora")
 def limpar_agora(email: str, max: int = 50):
-    user = upsert_user(email)  # garante user
-    creds = creds_from_db(user)
+    user_id = upsert_user(email)
+    creds = creds_from_db(user_id)
     if not creds:
         return JSONResponse({"erro": "Sem token válido. Faça login em /auth/login?email=..."} , status_code=401)
 
     service = get_gmail_service(creds)
     _, quar_id, _ = ensure_caixa_limpa_labels(service)
     moved = mover_para_quarentena(service, quar_id, max_results=max)
-    log_cleanup_run(user, moved)
+    log_cleanup_run(user_id, moved)
 
     return {
         "ok": True,
@@ -149,10 +146,12 @@ def cron_cleanup(secret: str, max: int = 50):
         creds = creds_from_db(user_id)
         if not creds:
             continue
+
         service = get_gmail_service(creds)
         _, quar_id, _ = ensure_caixa_limpa_labels(service)
         moved = mover_para_quarentena(service, quar_id, max_results=max)
         log_cleanup_run(user_id, moved)
+
         total_moved += moved
         processed += 1
 
