@@ -1,107 +1,137 @@
 import os
-import sqlite3
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-
-DB_PATH = os.getenv("DB_PATH", "caixa_limpa.db")
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não definido (crie um Postgres no Render e conecte no serviço).")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, sslmode="require")
 
 def init_db():
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS tokens (
-            user_id INTEGER PRIMARY KEY,
-            token_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS cleanup_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            moved INTEGER NOT NULL,
-            ran_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """)
-        conn.commit()
-
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tokens (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        token_json TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cleanup_runs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        moved_promocoes INTEGER DEFAULT 0,
+        moved_notificacoes INTEGER DEFAULT 0,
+        moved_quarentena INTEGER DEFAULT 0,
+        moved_lixo INTEGER DEFAULT 0,
+        trashed_lixo INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def upsert_user(email: str) -> int:
-    now = datetime.utcnow().isoformat()
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO users(email, created_at) VALUES(?, ?)", (email, now))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+    row = cur.fetchone()
+    if row:
+        user_id = row["id"]
+        cur.execute("UPDATE users SET updated_at=NOW() WHERE id=%s", (user_id,))
         conn.commit()
-        cur.execute("SELECT id FROM users WHERE email = ?", (email,))
-        row = cur.fetchone()
-        return int(row["id"])
+        cur.close()
+        conn.close()
+        return user_id
 
+    cur.execute("INSERT INTO users(email) VALUES(%s) RETURNING id", (email,))
+    user_id = cur.fetchone()["id"]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return user_id
 
 def save_token(user_id: int, token_json: str):
-    now = datetime.utcnow().isoformat()
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        INSERT INTO tokens(user_id, token_json, updated_at)
-        VALUES(?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET token_json=excluded.token_json, updated_at=excluded.updated_at
-        """, (user_id, token_json, now))
-        conn.commit()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM tokens WHERE user_id=%s", (user_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("UPDATE tokens SET token_json=%s, updated_at=NOW() WHERE user_id=%s", (token_json, user_id))
+    else:
+        cur.execute("INSERT INTO tokens(user_id, token_json) VALUES(%s, %s)", (user_id, token_json))
+    conn.commit()
+    cur.close()
+    conn.close()
 
+def load_token(user_id: int) -> str | None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT token_json FROM tokens WHERE user_id=%s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["token_json"] if row else None
 
-def load_token(user_id: int) -> Optional[str]:
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT token_json FROM tokens WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        return row["token_json"] if row else None
+def list_active_users():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email FROM users ORDER BY id ASC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
+def log_cleanup_run(user_id: int, resultado: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO cleanup_runs(
+        user_id, moved_promocoes, moved_notificacoes, moved_quarentena, moved_lixo, trashed_lixo
+    ) VALUES(%s,%s,%s,%s,%s,%s)
+    """, (
+        user_id,
+        int(resultado.get("promocoes", {}).get("moved", 0)),
+        int(resultado.get("notificacoes", {}).get("moved", 0)),
+        int(resultado.get("quarentena", {}).get("moved", 0)),
+        int(resultado.get("lixo", {}).get("moved", 0)),
+        int(resultado.get("lixo", {}).get("trashed", 0)),
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-def list_active_users() -> List[Dict[str, Any]]:
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        SELECT u.id, u.email
-        FROM users u
-        JOIN tokens t ON t.user_id = u.id
-        ORDER BY u.id ASC
-        """)
-        return [dict(r) for r in cur.fetchall()]
-
-
-def log_cleanup_run(user_id: int, moved: int):
-    now = datetime.utcnow().isoformat()
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO cleanup_runs(user_id, moved, ran_at) VALUES(?, ?, ?)", (user_id, moved, now))
-        conn.commit()
-
-
-def last_runs(email: str, limit: int = 10) -> List[Dict[str, Any]]:
-    with _conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        SELECT r.moved, r.ran_at
-        FROM cleanup_runs r
-        JOIN users u ON u.id = r.user_id
-        WHERE u.email = ?
-        ORDER BY r.ran_at DESC
-        LIMIT ?
-        """, (email, limit))
-        return [dict(r) for r in cur.fetchall()]
+def last_runs(email: str, limit: int = 10):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+    user = cur.fetchone()
+    if not user:
+        cur.close()
+        conn.close()
+        return []
+    user_id = user["id"]
+    cur.execute("""
+    SELECT moved_promocoes, moved_notificacoes, moved_quarentena, moved_lixo, trashed_lixo, created_at
+    FROM cleanup_runs
+    WHERE user_id=%s
+    ORDER BY created_at DESC
+    LIMIT %s
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
