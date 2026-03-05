@@ -7,9 +7,15 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 
 from db import (
-    init_db, upsert_user, save_token, load_token,
-    list_active_users, log_cleanup_run, last_runs
+    init_db,
+    upsert_user,
+    save_token,
+    load_token,
+    list_active_users,
+    log_cleanup_run,
+    last_runs,
 )
+
 from gmail_service import get_gmail_service, executar_limpeza_completa
 
 app = FastAPI()
@@ -21,7 +27,9 @@ REDIRECT_URI = f"{BASE_URL}/auth/callback"
 
 GOOGLE_CLIENT_SECRET_JSON = os.getenv("GOOGLE_CLIENT_SECRET_JSON", "")
 
+# Armazena flows em memória (MVP). Em produção ideal: Redis/DB.
 FLOW_STORE: dict[str, Flow] = {}
+
 
 def build_flow() -> Flow:
     if not GOOGLE_CLIENT_SECRET_JSON:
@@ -32,6 +40,7 @@ def build_flow() -> Flow:
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
     )
+
 
 def creds_from_db(user_id: int) -> Credentials | None:
     token_json = load_token(user_id)
@@ -49,18 +58,22 @@ def creds_from_db(user_id: int) -> Credentials | None:
             return None
     return creds
 
+
 @app.on_event("startup")
 def startup():
     init_db()
+
 
 @app.get("/")
 def home():
     return {
         "app": "CAIXA LIMPA API",
         "login": f"{BASE_URL}/auth/login?email=SEU_EMAIL",
-        "limpar_agora": f"{BASE_URL}/limpar-agora?email=SEU_EMAIL&max=50",
-        "cron_diario": f"{BASE_URL}/cron/cleanup?secret=SEU_SEGREDO",
+        "limpar_agora": f"{BASE_URL}/limpar-agora?email=SEU_EMAIL&max=200",
+        "relatorio": f"{BASE_URL}/relatorio?email=SEU_EMAIL",
+        "cron_diario": f"{BASE_URL}/cron/cleanup?secret=SEU_SEGREDO&max=200",
     }
+
 
 @app.get("/auth/login")
 def auth_login(email: str):
@@ -72,15 +85,20 @@ def auth_login(email: str):
     )
 
     FLOW_STORE[state] = flow
+    # MVP: guarda email no próprio flow (em produção, use sessão/redis)
     flow._caixa_email = email  # type: ignore[attr-defined]
 
     return RedirectResponse(auth_url)
+
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     state = request.query_params.get("state")
     if not state or state not in FLOW_STORE:
-        return JSONResponse({"erro": "state inválido/expirado. Faça login novamente."}, status_code=400)
+        return JSONResponse(
+            {"erro": "state inválido/expirado. Faça login novamente."},
+            status_code=400,
+        )
 
     flow = FLOW_STORE.pop(state)
     flow.fetch_token(authorization_response=str(request.url))
@@ -88,72 +106,105 @@ def auth_callback(request: Request):
 
     email = getattr(flow, "_caixa_email", None)
     if not email:
-        return JSONResponse({"erro": "email ausente no fluxo. Refaça /auth/login?email=..."} , status_code=400)
+        return JSONResponse(
+            {"erro": "email ausente no fluxo. Refaça /auth/login?email=..."},
+            status_code=400,
+        )
 
     user_id = upsert_user(email)
     save_token(user_id, creds.to_json())
 
+    # ✅ LIMPEZA COMPLETA (4 grupos)
     service = get_gmail_service(creds)
-    _, quar_id, _ = ensure_caixa_limpa_labels(service)
-    moved = mover_para_quarentena(service, quar_id, max_results=50)
-    log_cleanup_run(user_id, moved)
+    resultado = executar_limpeza_completa(service, max_results_por_grupo=200)
 
-    return JSONResponse({
-        "login": "sucesso",
-        "email": email,
-        "token_salvo_no_banco": True,
-        "emails_movidos_para_quarentena": moved,
-        "next": f"{BASE_URL}/limpar-agora?email={email}&max=50"
-    })
+    # Log simples (soma tudo que mexeu)
+    moved_total = sum(int(v) for v in resultado.values() if isinstance(v, int))
+    log_cleanup_run(user_id, moved_total)
+
+    return JSONResponse(
+        {
+            "login": "sucesso",
+            "email": email,
+            "token_salvo_no_banco": True,
+            "resultado": resultado,
+            "total_processado": moved_total,
+            "next": f"{BASE_URL}/limpar-agora?email={email}&max=200",
+        }
+    )
+
 
 @app.get("/limpar-agora")
-def limpar_agora(email: str, max: int = 50):
-    user_id = upsert_user(email)
+def limpar_agora(email: str, max: int = 200):
+    user_id = upsert_user(email)  # garante user
     creds = creds_from_db(user_id)
     if not creds:
-        return JSONResponse({"erro": "Sem token válido. Faça login em /auth/login?email=..."} , status_code=401)
+        return JSONResponse(
+            {"erro": "Sem token válido. Faça login em /auth/login?email=..."},
+            status_code=401,
+        )
 
+    # ✅ LIMPEZA COMPLETA (4 grupos)
     service = get_gmail_service(creds)
-    _, quar_id, _ = ensure_caixa_limpa_labels(service)
-    moved = mover_para_quarentena(service, quar_id, max_results=max)
-    log_cleanup_run(user_id, moved)
+    resultado = executar_limpeza_completa(service, max_results_por_grupo=max)
+
+    moved_total = sum(int(v) for v in resultado.values() if isinstance(v, int))
+    log_cleanup_run(user_id, moved_total)
 
     return {
         "ok": True,
         "email": email,
-        "moved": moved,
-        "label": "CAIXA_LIMPA/QUARENTENA",
-        "max_usado": max,
+        "resultado": resultado,
+        "total_processado": moved_total,
+        "max_usado_por_grupo": max,
     }
+
 
 @app.get("/relatorio")
 def relatorio(email: str, limit: int = 10):
     return {"email": email, "ultimas_execucoes": last_runs(email, limit=limit)}
 
+
 @app.get("/cron/cleanup")
-def cron_cleanup(secret: str, max: int = 50):
+def cron_cleanup(secret: str, max: int = 200):
     CRON_SECRET = os.getenv("CRON_SECRET", "")
     if not CRON_SECRET or secret != CRON_SECRET:
         return JSONResponse({"erro": "forbidden"}, status_code=403)
 
     users = list_active_users()
-    total_moved = 0
+
     processed = 0
+    totals = {
+        "promocoes_movidas": 0,
+        "notificacoes_movidas": 0,
+        "atualizacoes_para_quarentena": 0,
+        "spam_enviado_lixeira": 0,
+        "promocoes_muito_antigas_para_lixo": 0,
+    }
 
     for u in users:
         user_id = u["id"]
         email = u["email"]
+
         creds = creds_from_db(user_id)
         if not creds:
             continue
 
         service = get_gmail_service(creds)
-        _, quar_id, _ = ensure_caixa_limpa_labels(service)
-        moved = mover_para_quarentena(service, quar_id, max_results=max)
-        log_cleanup_run(user_id, moved)
+        resultado = executar_limpeza_completa(service, max_results_por_grupo=max)
 
-        total_moved += moved
+        # soma no total geral
+        for k in totals.keys():
+            totals[k] += int(resultado.get(k, 0) or 0)
+
+        moved_total = sum(int(v) for v in resultado.values() if isinstance(v, int))
+        log_cleanup_run(user_id, moved_total)
+
         processed += 1
 
-    return {"ok": True, "usuarios_processados": processed, "total_movidos": total_moved}
-
+    return {
+        "ok": True,
+        "usuarios_processados": processed,
+        "totais": totals,
+        "max_usado_por_grupo": max,
+    }
