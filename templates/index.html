@@ -1,64 +1,42 @@
 <!doctype html>
 <html lang="pt-br">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Caixa Limpa</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css"/>
 </head>
 <body>
-  <div class="bg"></div>
-
-  <main class="wrap">
+  <div class="wrap">
     <header class="top">
-      <div class="logo">CAIXA <span>LIMPA</span></div>
-      <a class="link" href="/api" target="_blank">Ver API</a>
+      <div class="logo">📩 Caixa Limpa</div>
+      <div class="badge">MiniSaaS</div>
     </header>
 
-    <section class="hero">
-      <h1>Organize seu Gmail automaticamente</h1>
+    <main class="card">
+      <h1>Deixe sua caixa de entrada só com o que importa.</h1>
       <p class="sub">
-        Separe promoções, notificações e lixo em pastas — e deixe na caixa de entrada só o que importa.
+        O Caixa Limpa separa automaticamente seus e-mails em:
+        <b>Importantes</b>, <b>Promoções</b>, <b>Notificações</b> e <b>Lixo</b>.
       </p>
 
-      <div class="card">
-        <h2>Conectar agora</h2>
-        <p class="small">Digite seu e-mail do Gmail e clique em conectar.</p>
+      <form class="form" method="get" action="/auth/login">
+        <label>Seu e-mail do Gmail</label>
+        <input name="email" type="email" placeholder="seuemail@gmail.com" required />
+        <button type="submit">Conectar com Google</button>
+      </form>
 
-        <form class="form" method="GET" action="/auth/login">
-          <input class="input" type="email" name="email" placeholder="seuemail@gmail.com" required />
-          <button class="btn" type="submit">Conectar meu Gmail</button>
-        </form>
-
-        <div class="note">
-          Ao conectar, você autoriza o Caixa Limpa a <b>organizar</b> seus e-mails.
-        </div>
-      </div>
-
-      <div class="grid">
-        <div class="box">
-          <div class="tag ok">IMPORTANTES</div>
-          <p>Banco, trabalho, clientes, família e comprovantes ficam na Caixa de Entrada.</p>
-        </div>
-        <div class="box">
-          <div class="tag">PROMOÇÕES</div>
-          <p>Ofertas, newsletters e marketing vão para <b>CAIXA_LIMPA/PROMOCOES</b>.</p>
-        </div>
-        <div class="box">
-          <div class="tag">NOTIFICAÇÕES</div>
-          <p>Redes sociais e alertas vão para <b>CAIXA_LIMPA/NOTIFICACOES</b>.</p>
-        </div>
-        <div class="box">
-          <div class="tag bad">LIXO/SPAM</div>
-          <p>Spam e propaganda repetida vão para <b>CAIXA_LIMPA/LIXO</b>.</p>
-        </div>
+      <div class="info">
+        <div class="pill">✅ Promoções → após 2 dias</div>
+        <div class="pill">✅ Notificações → após 1 dia</div>
+        <div class="pill">✅ Atualizações → após 5 dias</div>
+        <div class="pill">🗑️ Spam → lixeira</div>
       </div>
 
       <footer class="foot">
-        <div>© Caixa Limpa</div>
-        <div class="muted">{{ base_url }}</div>
+        <span>Backend: {{ base_url }}</span>
       </footer>
-    </section>
-  </main>
+    </main>
+  </div>
 </body>
 </html>
