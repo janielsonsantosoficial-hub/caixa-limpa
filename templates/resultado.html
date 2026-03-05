@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Resultado - Caixa Limpa</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="logo">📩 Caixa Limpa</div>
+      <div class="badge">Conectado</div>
+    </header>
+
+    <main class="card">
+      <h1>Pronto! Limpeza concluída ✅</h1>
+      <p class="sub">Conta: <b>{{ email }}</b></p>
+
+      <div class="grid">
+        <div class="box">
+          <h3>Promoções</h3>
+          <p><b>{{ resultado.promocoes.moved }}</b> movidos</p>
+        </div>
+        <div class="box">
+          <h3>Notificações</h3>
+          <p><b>{{ resultado.notificacoes.moved }}</b> movidos</p>
+        </div>
+        <div class="box">
+          <h3>Quarentena</h3>
+          <p><b>{{ resultado.quarentena.moved }}</b> movidos</p>
+        </div>
+        <div class="box">
+          <h3>Lixo / Spam</h3>
+          <p><b>{{ resultado.lixo.moved }}</b> movidos</p>
+          <p><b>{{ resultado.lixo.trashed }}</b> enviados p/ lixeira</p>
+        </div>
+      </div>
+
+      <div class="actions">
+        <a class="link" href="{{ base_url }}/">Voltar</a>
+        <a class="link" href="{{ base_url }}/relatorio?email={{ email }}">Ver relatório (JSON)</a>
+        <a class="btn" href="{{ base_url }}/limpar-agora?email={{ email }}&max=200">Limpar agora</a>
+      </div>
+
+      <p class="hint">
+        Dica: no Gmail você verá as labels:
+        <b>CAIXA_LIMPA/PROMOCOES</b>, <b>CAIXA_LIMPA/NOTIFICACOES</b>, <b>CAIXA_LIMPA/QUARENTENA</b> e <b>CAIXA_LIMPA/LIXO</b>.
+      </p>
+    </main>
+  </div>
+</body>
+</html>
