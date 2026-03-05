@@ -10,7 +10,7 @@ from db import (
     init_db, upsert_user, save_token, load_token,
     list_active_users, log_cleanup_run, last_runs
 )
-from gmail_service import get_gmail_service, ensure_caixa_limpa_labels, mover_para_quarentena
+from gmail_service import get_gmail_service, executar_limpeza_completa
 
 app = FastAPI()
 
@@ -156,3 +156,4 @@ def cron_cleanup(secret: str, max: int = 50):
         processed += 1
 
     return {"ok": True, "usuarios_processados": processed, "total_movidos": total_moved}
+
