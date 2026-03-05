@@ -2,8 +2,8 @@ import os
 import json
 from datetime import datetime, timezone
 
-import psycopg2
-from psycopg2.rows import dict_row
+from psycopg.rows import dict_row
+import psycopg
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -12,7 +12,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def _conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada no ambiente do Render.")
-    return psycopg2.connect(DATABASE_URL, row_factory=dict_row)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_db():
@@ -112,5 +112,6 @@ def last_runs(limit: int = 50):
                 LIMIT %s;
             """, (limit,))
             return cur.fetchall()
+
 
 
