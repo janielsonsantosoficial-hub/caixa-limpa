@@ -5,5 +5,5 @@ google-auth-oauthlib==1.2.1
 google-api-python-client==2.191.0
 requests-oauthlib==2.0.0
 python-dotenv==1.0.1
-psycopg2-binary==2.9.9
+psycopg[binary]==3.2.3
 cryptography==42.0.8
